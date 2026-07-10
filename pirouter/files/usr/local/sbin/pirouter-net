@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+# ==========================================================================
+#  pirouter-net  -  bring up LAN, access point, DHCP and base routing
+#  usage: pirouter-net {apply|restart|status}
+# ==========================================================================
+set -uo pipefail
+source /usr/local/lib/pirouter/common.sh
+need_root
+load_conf
+
+# restart a systemd unit without ever hanging the caller (whiptail gauge!)
+restart_svc() {
+  local s="$1"
+  if timeout 30 systemctl restart "$s"; then
+    log "pirouter-net: $s restarted"
+    return 0
+  fi
+  log "pirouter-net: ERROR restarting $s"
+  systemctl status "$s" --no-pager -l 2>&1 | tail -n 25 >>"$LOG" 2>/dev/null || true
+  journalctl -u "$s" --no-pager -n 25 2>&1 >>"$LOG" 2>/dev/null || true
+  return 1
+}
+
+gen_hostapd() {
+  cat >/etc/hostapd/hostapd.conf <<EOF
+interface=${LAN_IF}
+driver=nl80211
+ssid=${WIFI_SSID}
+country_code=${WIFI_COUNTRY}
+hw_mode=g
+channel=${WIFI_CHANNEL}
+ieee80211n=1
+wmm_enabled=1
+ignore_broadcast_ssid=${WIFI_HIDDEN}
+auth_algs=1
+EOF
+
+  # security block depends on WIFI_SECURITY
+  case "${WIFI_SECURITY:-wpa2}" in
+    open)
+      # no wpa lines at all -> open network
+      ;;
+    wpa3)
+      cat >>/etc/hostapd/hostapd.conf <<EOF
+wpa=2
+wpa_key_mgmt=SAE
+rsn_pairwise=CCMP
+ieee80211w=2
+sae_require_mfp=1
+wpa_passphrase=${WIFI_PASS}
+EOF
+      ;;
+    wpa2wpa3)
+      cat >>/etc/hostapd/hostapd.conf <<EOF
+wpa=2
+wpa_key_mgmt=WPA-PSK SAE
+rsn_pairwise=CCMP
+ieee80211w=1
+wpa_passphrase=${WIFI_PASS}
+EOF
+      ;;
+    *) # wpa2 (default)
+      cat >>/etc/hostapd/hostapd.conf <<EOF
+wpa=2
+wpa_key_mgmt=WPA-PSK
+rsn_pairwise=CCMP
+wpa_passphrase=${WIFI_PASS}
+EOF
+      ;;
+  esac
+
+  echo 'DAEMON_CONF="/etc/hostapd/hostapd.conf"' >/etc/default/hostapd
+}
+
+gen_dnsmasq() {
+  cat >/etc/dnsmasq.d/pirouter.conf <<EOF
+interface=${LAN_IF}
+bind-interfaces
+domain-needed
+bogus-priv
+dhcp-range=${DHCP_START},${DHCP_END},${DHCP_LEASE}
+dhcp-option=3,${LAN_IP}
+dhcp-option=6,${LAN_DNS//,/ ,}
+EOF
+  # DNS servers for dnsmasq upstream
+  : >/etc/dnsmasq.d/pirouter-dns.conf
+  IFS=',' read -ra DNS <<<"$LAN_DNS"
+  for d in "${DNS[@]}"; do echo "server=${d// /}" >>/etc/dnsmasq.d/pirouter-dns.conf; done
+}
+
+setup_lan_ip() {
+  ip addr flush dev "$LAN_IF" 2>/dev/null || true
+  ip link set "$LAN_IF" up 2>/dev/null || true
+  ip addr add "${LAN_IP}/${LAN_CIDR}" dev "$LAN_IF" 2>/dev/null || true
+}
+
+enable_forwarding() {
+  sysctl -qw net.ipv4.ip_forward=1
+  echo 'net.ipv4.ip_forward=1' >/etc/sysctl.d/99-pirouter.conf
+}
+
+apply() {
+  log "pirouter-net: applying network config"
+  rfkill unblock wlan 2>/dev/null || true
+
+  # make sure nothing else is holding wlan0 right now (needed when applying
+  # without a reboot). eth0/WAN is untouched.
+  if command -v nmcli >/dev/null 2>&1; then
+    nmcli dev set "$LAN_IF" managed no 2>/dev/null || true
+  fi
+  systemctl stop "wpa_supplicant@${LAN_IF}.service" 2>/dev/null || true
+  pkill -f "wpa_supplicant.*${LAN_IF}" 2>/dev/null || true
+
+  # apply custom MAC before interfaces come up
+  pirouter-mac apply || true
+
+  gen_hostapd
+  gen_dnsmasq
+  setup_lan_ip
+  enable_forwarding
+
+  # validate the AP config before (re)starting so we fail fast with a reason
+  if command -v hostapd >/dev/null 2>&1; then
+    if ! hostapd -t /etc/hostapd/hostapd.conf >/dev/null 2>>"$LOG"; then
+      log "pirouter-net: WARNING hostapd config check reported issues (see $LOG)"
+    fi
+  fi
+
+  systemctl unmask hostapd 2>/dev/null || true
+  local ok=0
+  restart_svc hostapd || ok=1
+  restart_svc dnsmasq || ok=1
+
+  if [ "$ok" -ne 0 ]; then
+    log "pirouter-net: one or more services failed to start (see $LOG). Common cause: wlan0 still managed by NetworkManager/wpa_supplicant, or Wi-Fi blocked by rfkill."
+  fi
+
+  # (re)build firewall + NAT according to killswitch/vpn state
+  pirouter-killswitch apply || log "pirouter-net: killswitch apply returned non-zero"
+
+  # warn if the LAN subnet collides with the upstream router (client mode)
+  if [ "${ROUTER_MODE:-client}" = "client" ] && subnet_conflict "$LAN_IP" "$LAN_CIDR" "$WAN_IF"; then
+    log "WARNING: LAN subnet ${LAN_IP}/${LAN_CIDR} overlaps the upstream router ($(wan_subnet "$WAN_IF")). Change the Pi LAN IP to avoid routing problems."
+  fi
+
+  log "pirouter-net: done (mode=${ROUTER_MODE:-client} AP=${WIFI_SSID} LAN=${LAN_IP})"
+  return "$ok"
+}
+
+status() {
+  echo "== Interfaces =="
+  ip -brief addr show "$WAN_IF" "$LAN_IF" 2>/dev/null || true
+  echo
+  echo "== hostapd ==";  systemctl is-active hostapd
+  echo "== dnsmasq =="; systemctl is-active dnsmasq
+  echo
+  echo "Mode:      ${ROUTER_MODE:-client}"
+  echo "SSID:      $WIFI_SSID"
+  echo "LAN IP:    $LAN_IP/$LAN_CIDR"
+  echo "WAN net:   $(wan_subnet "$WAN_IF" || echo 'no link')"
+  echo "DHCP:      $DHCP_START - $DHCP_END"
+}
+
+case "${1:-apply}" in
+  apply|restart) apply ;;
+  status) status ;;
+  *) echo "usage: pirouter-net {apply|restart|status}"; exit 1 ;;
+esac

@@ -1,0 +1,14 @@
+[Unit]
+Description=pirouter - apply router/AP/firewall config at boot
+After=network-online.target
+Wants=network-online.target
+Before=hostapd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/pirouter-net apply
+ExecStartPost=/bin/bash -c 'source /etc/pirouter/pirouter.conf; [ "$ACTIVE_VPN" != "none" ] && /usr/local/sbin/pirouter-vpn up "$ACTIVE_VPN" || true'
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# ==========================================================================
+#  pirouter-mac  -  spoof / restore MAC on WAN (eth0) and Wi-Fi (wlan0)
+#  usage:
+#     pirouter-mac apply                 # apply MACs from config
+#     pirouter-mac set wifi <MAC|random|auto>
+#     pirouter-mac set wan  <MAC|random|auto>
+#     pirouter-mac show
+#
+#     pirouter-mac profile save <name> <MAC>     # add a named MAC to the book
+#     pirouter-mac profile savecur <name> <wifi|wan>  # save the live MAC
+#     pirouter-mac profile list
+#     pirouter-mac profile del <name>
+#  ("set wifi|wan <name>" also accepts a saved profile name)
+# ==========================================================================
+set -uo pipefail
+source /usr/local/lib/pirouter/common.sh
+need_root
+load_conf
+enable_error_trap
+
+set_iface_mac() {
+  local ifc="$1" mac="$2"
+  [ -n "$ifc" ] || return 0
+  ip link show "$ifc" &>/dev/null || { log "mac: no iface $ifc"; return 0; }
+  ip link set "$ifc" down
+  ip link set "$ifc" address "$mac"
+  ip link set "$ifc" up
+  log "mac: $ifc -> $mac"
+}
+
+resolve() {
+  # resolve a config value to a real MAC for iface. Accepts:
+  #   auto | random | explicit MAC | a saved profile name
+  local ifc="$1" val="$2" pm
+  case "$val" in
+    auto)   cat "/sys/class/net/$ifc/address" 2>/dev/null ;;
+    random) random_mac ;;
+    *)
+      if valid_mac "$val"; then
+        echo "$val"
+      elif pm=$(mac_by_name "$val" 2>/dev/null); then
+        echo "$pm"
+      else
+        echo "$val"
+      fi
+      ;;
+  esac
+}
+
+apply() {
+  # WAN
+  local m
+  m=$(resolve "$WAN_IF" "$WAN_MAC")
+  [ -n "$m" ] && set_iface_mac "$WAN_IF" "$m"
+  # WiFi
+  m=$(resolve "$LAN_IF" "$WIFI_MAC")
+  [ -n "$m" ] && set_iface_mac "$LAN_IF" "$m"
+}
+
+set_target() {
+  local target="$1" val="$2" ifc key
+  case "$target" in
+    wifi) ifc="$LAN_IF"; key="WIFI_MAC" ;;
+    wan)  ifc="$WAN_IF"; key="WAN_MAC" ;;
+    *) die "target must be wifi|wan" ;;
+  esac
+  case "$val" in
+    auto|random) : ;;
+    *)
+      if ! valid_mac "$val" && ! mac_by_name "$val" >/dev/null 2>&1; then
+        die "invalid MAC or unknown profile: $val"
+      fi
+      ;;
+  esac
+  set_conf "$key" "$val"
+  local m; m=$(resolve "$ifc" "$val")
+  set_iface_mac "$ifc" "$m"
+}
+
+# ---------------------------------------------------------------- profiles
+profile_cmd() {
+  local sub="${1:-list}"; shift || true
+  case "$sub" in
+    save)    mac_profile_add "${1:-}" "${2:-}" ;;
+    savecur)
+      local name="${1:-}" tgt="${2:-}" ifc
+      case "$tgt" in wifi) ifc="$LAN_IF";; wan) ifc="$WAN_IF";; *) die "savecur needs wifi|wan";; esac
+      local cur; cur=$(cat "/sys/class/net/$ifc/address" 2>/dev/null)
+      mac_profile_add "$name" "$cur"
+      ;;
+    list)
+      if [ -s "$MAC_STORE" ]; then
+        awk -F'\t' '{printf "%-16s %s\n",$1,$2}' "$MAC_STORE"
+      else
+        echo "(no saved MAC profiles)"
+      fi
+      ;;
+    del)     mac_profile_del "${1:-}" ;;
+    *) die "profile subcommand: save|savecur|list|del" ;;
+  esac
+}
+
+show() {
+  for ifc in "$WAN_IF" "$LAN_IF"; do
+    printf '%-6s %s\n' "$ifc" "$(cat "/sys/class/net/$ifc/address" 2>/dev/null || echo n/a)"
+  done
+}
+
+case "${1:-apply}" in
+  apply)   apply ;;
+  set)     set_target "${2:-}" "${3:-}" ;;
+  show)    show ;;
+  profile) shift; profile_cmd "$@" ;;
+  *) echo "usage: pirouter-mac {apply|set wifi|wan <MAC|name|random|auto>|show|profile ...}"; exit 1 ;;
+esac

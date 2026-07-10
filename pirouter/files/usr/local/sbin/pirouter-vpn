@@ -1,0 +1,282 @@
+#!/usr/bin/env bash
+# ==========================================================================
+#  pirouter-vpn  -  start/stop the selected VPN backend and rewire firewall
+#
+#  usage:
+#     pirouter-vpn up <openvpn|l2tp|vless|proxy>
+#     pirouter-vpn down
+#     pirouter-vpn status
+#     pirouter-vpn test           # ping + public-IP check on the active tunnel
+#
+#  Config files expected:
+#     OpenVPN : /etc/pirouter/openvpn/client.conf  (+ certs referenced inside)
+#     L2TP    : uses L2TP_* keys from pirouter.conf
+#     VLESS   : VLESS_URL in pirouter.conf (managed via profile store)
+#     Proxy   : PROXY_* keys in pirouter.conf
+# ==========================================================================
+set -uo pipefail
+source /usr/local/lib/pirouter/common.sh
+need_root
+load_conf
+enable_error_trap
+
+XRAY_CONF="/etc/pirouter/xray/config.json"
+
+# ---------------------------------------------------------------- OpenVPN
+ovpn_up() {
+  local cfg="/etc/pirouter/openvpn/client.conf"
+  [ -f "$cfg" ] || die "OpenVPN config not found: $cfg (upload it first)"
+  install -D -m 600 "$cfg" /etc/openvpn/client/pirouter.conf
+  run_logged "enable openvpn-client@pirouter" \
+    systemctl enable --now openvpn-client@pirouter
+  # wait for tun0
+  local i
+  for i in $(seq 1 20); do ip link show tun0 &>/dev/null && break; sleep 1; done
+  ip link show tun0 &>/dev/null || die "tun0 did not come up (check credentials/config; see: journalctl -u openvpn-client@pirouter)"
+  log_info "openvpn: tun0 is up"
+}
+ovpn_down() { systemctl disable --now openvpn-client@pirouter 2>/dev/null || true; }
+
+# ---------------------------------------------------------------- L2TP/IPsec
+l2tp_up() {
+  [ -n "$L2TP_SERVER" ] || die "L2TP_SERVER empty"
+  cat >/etc/ipsec.conf <<EOF
+config setup
+conn pirouter-l2tp
+    keyexchange=ikev1
+    authby=secret
+    type=transport
+    left=%defaultroute
+    leftprotoport=17/1701
+    right=${L2TP_SERVER}
+    rightprotoport=17/1701
+    auto=start
+EOF
+  printf ': PSK "%s"\n' "$L2TP_PSK" >/etc/ipsec.secrets
+  chmod 600 /etc/ipsec.secrets
+
+  mkdir -p /etc/xl2tpd
+  cat >/etc/xl2tpd/xl2tpd.conf <<EOF
+[lac pirouter]
+lns = ${L2TP_SERVER}
+ppp debug = no
+pppoptfile = /etc/ppp/options.l2tpd.client
+length bit = yes
+EOF
+  cat >/etc/ppp/options.l2tpd.client <<EOF
+ipcp-accept-local
+ipcp-accept-remote
+refuse-eap
+require-mschap-v2
+noccp
+noauth
+mtu 1280
+mru 1280
+noipdefault
+defaultroute
+replacedefaultroute
+usepeerdns
+connect-delay 5000
+name ${L2TP_USER}
+password ${L2TP_PASS}
+EOF
+  chmod 600 /etc/ppp/options.l2tpd.client
+
+  run_logged "restart strongswan" bash -c \
+    'systemctl restart strongswan-starter 2>/dev/null || systemctl restart strongswan 2>/dev/null || ipsec restart'
+  sleep 2
+  run_logged "restart xl2tpd" systemctl restart xl2tpd
+  sleep 2
+  mkdir -p /var/run/xl2tpd
+  echo "c pirouter" >/var/run/xl2tpd/l2tp-control 2>/dev/null || true
+  local i
+  for i in $(seq 1 20); do ip link show ppp0 &>/dev/null && break; sleep 1; done
+  ip link show ppp0 &>/dev/null || die "ppp0 did not come up (check server/psk/creds; see: journalctl -u xl2tpd)"
+  log_info "l2tp: ppp0 is up"
+}
+l2tp_down() {
+  echo "d pirouter" >/var/run/xl2tpd/l2tp-control 2>/dev/null || true
+  systemctl stop xl2tpd 2>/dev/null || true
+  ipsec stop 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------- Xray (vless/proxy)
+build_xray_conf() {
+  local mode="$1" outbound
+  mkdir -p "$(dirname "$XRAY_CONF")"
+
+  if [ "$mode" = "vless" ]; then
+    [ -n "$VLESS_URL" ] || die "VLESS_URL empty (add/select a VLESS profile first)"
+    outbound="$(python3 /usr/local/lib/pirouter/vless2json.py "$VLESS_URL")" \
+      || die "failed to parse VLESS link: $(python3 /usr/local/lib/pirouter/vless2json.py "$VLESS_URL" 2>&1 >/dev/null)"
+  else
+    [ -n "$PROXY_HOST" ] || die "PROXY_HOST empty"
+    [ -n "$PROXY_PORT" ] || die "PROXY_PORT empty"
+    local proto="socks"; [ "$PROXY_TYPE" = "http" ] && proto="http"
+    local userblock="[]"
+    if [ -n "$PROXY_USER" ]; then
+      userblock="[{\"user\":\"${PROXY_USER}\",\"pass\":\"${PROXY_PASS}\"}]"
+    fi
+    outbound=$(cat <<EOF
+{
+  "tag": "proxy",
+  "protocol": "${proto}",
+  "settings": {
+    "servers": [{
+      "address": "${PROXY_HOST}",
+      "port": ${PROXY_PORT},
+      "users": ${userblock}
+    }]
+  }
+}
+EOF
+)
+  fi
+
+  cat >"$XRAY_CONF" <<EOF
+{
+  "log": { "loglevel": "warning" },
+  "inbounds": [
+    {
+      "tag": "transparent",
+      "listen": "0.0.0.0",
+      "port": ${XRAY_REDIR_PORT},
+      "protocol": "dokodemo-door",
+      "settings": { "network": "tcp", "followRedirect": true },
+      "sniffing": { "enabled": true, "destOverride": ["http","tls","quic"] }
+    },
+    {
+      "tag": "dns-in",
+      "listen": "127.0.0.1",
+      "port": ${XRAY_DNS_PORT},
+      "protocol": "dokodemo-door",
+      "settings": { "address": "1.1.1.1", "port": 53, "network": "tcp,udp" }
+    },
+    {
+      "tag": "socks-test",
+      "listen": "127.0.0.1",
+      "port": ${XRAY_SOCKS_PORT},
+      "protocol": "socks",
+      "settings": { "udp": true }
+    }
+  ],
+  "outbounds": [
+    ${outbound},
+    { "tag": "direct", "protocol": "freedom", "settings": { "domainStrategy": "UseIP" } },
+    { "tag": "block", "protocol": "blackhole" }
+  ],
+  "routing": {
+    "domainStrategy": "AsIs",
+    "rules": [
+      { "type": "field", "inboundTag": ["dns-in"], "outboundTag": "proxy" },
+      { "type": "field", "inboundTag": ["transparent","socks-test"], "outboundTag": "proxy" }
+    ]
+  }
+}
+EOF
+  chmod 600 "$XRAY_CONF"
+  /usr/local/bin/xray -test -c "$XRAY_CONF" >>"$LOG" 2>&1 \
+    || die "xray config invalid (see $LOG)"
+}
+
+xray_up() {
+  local mode="$1"
+  build_xray_conf "$mode"
+  # point router DNS at xray's DNS inbound to avoid DNS leaks
+  echo "server=127.0.0.1#${XRAY_DNS_PORT}" >/etc/dnsmasq.d/pirouter-dns.conf
+  systemctl restart dnsmasq 2>/dev/null || true
+  run_logged "enable xray" systemctl enable --now xray
+  sleep 2
+  is_service_active xray || die "xray failed to start (see: journalctl -u xray)"
+  log_info "xray: running ($mode)"
+}
+xray_down() {
+  systemctl disable --now xray 2>/dev/null || true
+  : >/etc/dnsmasq.d/pirouter-dns.conf
+  IFS=',' read -ra DNS <<<"$LAN_DNS"
+  for d in "${DNS[@]}"; do echo "server=${d// /}" >>/etc/dnsmasq.d/pirouter-dns.conf; done
+  systemctl restart dnsmasq 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------- orchestration
+down_all() {
+  ovpn_down; l2tp_down; xray_down
+  set_conf ACTIVE_VPN none
+  pirouter-killswitch apply
+  log "vpn: all backends down"
+}
+
+up() {
+  local kind="$1"
+  down_all
+  case "$kind" in
+    openvpn) ovpn_up ;;
+    l2tp)    l2tp_up ;;
+    vless)   xray_up vless ;;
+    proxy)   xray_up proxy ;;
+    *) die "unknown vpn kind: $kind" ;;
+  esac
+  set_conf ACTIVE_VPN "$kind"
+  pirouter-killswitch apply
+  log "vpn: $kind is UP"
+  echo
+  echo "== Connection test =="
+  vpn_test || echo "NOTE: tunnel is up but the self-test did not confirm egress yet - retry in a few seconds."
+}
+
+# ---------------------------------------------------------------- tests
+vpn_test() {
+  load_conf
+  local kind="$ACTIVE_VPN"
+  case "$kind" in
+    vless|proxy)
+      is_service_active xray || { echo "xray is not running"; return 1; }
+      echo "Reaching server ${VLESS_URL:+(vless)}..."
+      local tip wip
+      tip=$(pub_ip "127.0.0.1:${XRAY_SOCKS_PORT}") || tip=""
+      wip=$(pub_ip) || wip=""
+      echo "Tunnel public IP : ${tip:-FAILED}"
+      echo "Direct WAN IP    : ${wip:-n/a}"
+      if [ -n "$tip" ]; then
+        if [ -n "$wip" ] && [ "$tip" = "$wip" ]; then
+          echo "WARNING: tunnel IP == WAN IP. Traffic may NOT be tunneled!"
+          return 1
+        fi
+        echo "OK: traffic is flowing through the tunnel."
+        return 0
+      fi
+      echo "FAIL: could not reach the internet through the tunnel."
+      return 1
+      ;;
+    openvpn|l2tp)
+      local tun; tun="$(vpn_tun_iface)"
+      [ -n "$tun" ] || { echo "tunnel interface is down"; return 1; }
+      echo "Tunnel interface : $tun"
+      test_ping 1.1.1.1 4
+      local ip; ip=$(pub_ip) || ip=""
+      echo "Public IP (via tunnel default route): ${ip:-FAILED}"
+      [ -n "$ip" ]
+      ;;
+    *)
+      echo "No VPN is active."
+      return 1
+      ;;
+  esac
+}
+
+status() {
+  echo "ACTIVE_VPN: $ACTIVE_VPN"
+  [ -n "${VLESS_ACTIVE:-}" ] && echo "VLESS prof: $VLESS_ACTIVE"
+  echo "tunnel:     $(vpn_tun_iface || echo none)"
+  echo "openvpn:    $(systemctl is-active openvpn-client@pirouter 2>/dev/null || echo inactive)"
+  echo "xl2tpd:     $(systemctl is-active xl2tpd 2>/dev/null || echo inactive)"
+  echo "xray:       $(systemctl is-active xray 2>/dev/null || echo inactive)"
+}
+
+case "${1:-status}" in
+  up)   [ -n "${2:-}" ] || die "specify: openvpn|l2tp|vless|proxy"; up "$2" ;;
+  down) down_all ;;
+  test) vpn_test ;;
+  status) status ;;
+  *) echo "usage: pirouter-vpn {up <kind>|down|test|status}"; exit 1 ;;
+esac

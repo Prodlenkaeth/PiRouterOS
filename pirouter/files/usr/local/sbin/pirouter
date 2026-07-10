@@ -1,0 +1,500 @@
+#!/usr/bin/env bash
+# ==========================================================================
+#  pirouter  -  whiptail control panel (run over SSH)
+#  Just type: sudo pirouter
+# ==========================================================================
+set -uo pipefail
+source /usr/local/lib/pirouter/common.sh
+need_root
+
+BT="PiRouter Control Panel"
+
+msg()   { whiptail --title "$BT" --msgbox "$1" 16 74; }
+yesno() { whiptail --title "$BT" --yesno "$1" 12 70; }
+inbox() { whiptail --title "$BT" --inputbox "$1" 10 70 "$2" 3>&1 1>&2 2>&3; }
+pwbox() { whiptail --title "$BT" --passwordbox "$1" 10 70 3>&1 1>&2 2>&3; }
+
+apply_all() {
+  local rc_file="$STATE_DIR/apply.rc"
+  echo 0 >"$rc_file"
+  {
+    echo 10
+    timeout 60 pirouter-mac apply       >>"$LOG" 2>&1 || echo mac  >>"$rc_file"
+    echo 40
+    timeout 90 pirouter-net apply        >>"$LOG" 2>&1 || echo net  >>"$rc_file"
+    echo 80
+    timeout 60 pirouter-killswitch apply >>"$LOG" 2>&1 || echo fw   >>"$rc_file"
+    echo 100
+  } | whiptail --title "$BT" --gauge "Applying configuration..." 8 70 0
+
+  local failed
+  failed=$(grep -vx 0 "$rc_file" | tr '\n' ' ')
+  if [ -n "$failed" ]; then
+    whiptail --title "$BT" --scrolltext --msgbox \
+"Some steps reported problems: ${failed}
+
+Last log lines:
+$(tail -n 18 "$LOG" 2>/dev/null)
+
+Tip: if hostapd failed, wlan0 is usually still held by NetworkManager/wpa_supplicant, or Wi-Fi is rfkill-blocked. A reboot often clears it." 24 78
+  else
+    msg "Configuration applied.\n\nSSID: $(. $CONF; echo $WIFI_SSID)\nLAN:  $(. $CONF; echo $LAN_IP)"
+  fi
+}
+
+# ------------------------------------------------------------------ STATUS
+show_status() {
+  load_conf
+  local tun; tun="$(vpn_tun_iface || true)"
+  local wan_ip; wan_ip=$(ip -4 addr show "$WAN_IF" 2>/dev/null | awk '/inet /{print $2}' | head -1)
+  local out
+  out=$(cat <<EOF
+Mode       : ${ROUTER_MODE:-client}  ($([ "${ROUTER_MODE:-client}" = client ] && echo 'behind main router' || echo 'main router'))
+Wi-Fi SSID : ${WIFI_SSID}   (channel ${WIFI_CHANNEL})
+Wi-Fi sec  : ${WIFI_SECURITY:-wpa2}
+LAN IP     : ${LAN_IP}/${LAN_CIDR}
+WAN (${WAN_IF}) : ${wan_ip:-no link}
+
+Wi-Fi MAC  : $(cat /sys/class/net/$LAN_IF/address 2>/dev/null)  [cfg:${WIFI_MAC}]
+WAN  MAC   : $(cat /sys/class/net/$WAN_IF/address 2>/dev/null)  [cfg:${WAN_MAC}]
+
+Kill switch: ${KILLSWITCH}
+Active VPN : ${ACTIVE_VPN}   tunnel: ${tun:-none}
+
+hostapd:${DASH:-} $(systemctl is-active hostapd)   dnsmasq: $(systemctl is-active dnsmasq)
+EOF
+)
+  msg "$out"
+}
+
+# ------------------------------------------------------------------ ROUTER MODE
+mode_menu() {
+  load_conf
+  local choice new
+  choice=$(whiptail --title "$BT" --menu "Router mode  (current: ${ROUTER_MODE:-client})" 18 76 6 \
+    "gateway" "MAIN router  - uplink comes straight from modem/ISP" \
+    "client"  "BEHIND router - Pi plugs into your existing router (cable)" \
+    "?"       "What's the difference?" \
+    3>&1 1>&2 2>&3) || return
+
+  case "$choice" in
+    "?")
+      msg "GATEWAY (main router):\n  The Pi IS your primary router. The internet source (modem/ISP) plugs into ${WAN_IF}. The Pi creates its own network.\n\nCLIENT (behind main router):\n  You already have a main router. You plug the Pi into it with a cable (${WAN_IF}). The Pi gets internet from it and offers a separate VPN Wi-Fi.\n  In this mode the Pi's LAN subnet MUST differ from the main router's subnet - the panel checks this for you."
+      return ;;
+    gateway|client) new="$choice" ;;
+    *) return ;;
+  esac
+
+  set_conf ROUTER_MODE "$new"
+
+  # In client mode, guard against a subnet clash with the upstream router.
+  if [ "$new" = "client" ]; then
+    if subnet_conflict "$LAN_IP" "$LAN_CIDR" "$WAN_IF"; then
+      local sug; sug=$(suggest_lan_subnet "$WAN_IF")
+      if yesno "Your LAN (${LAN_IP}/${LAN_CIDR}) overlaps the main router's network ($(wan_subnet "$WAN_IF")).\n\nThis will break routing. Change the Pi LAN IP to ${sug} automatically?"; then
+        local base="${sug%.*}"
+        set_conf LAN_IP "$sug"
+        set_conf DHCP_START "${base}.50"
+        set_conf DHCP_END "${base}.200"
+      fi
+    fi
+  fi
+
+  if yesno "Mode set to '${new}'. Apply now?"; then apply_all; fi
+}
+
+# ------------------------------------------------------------------ WIFI
+wifi_menu() {
+  load_conf
+  local ssid pass ch sec
+  ssid=$(inbox "Wi-Fi network name (SSID):" "$WIFI_SSID") || return
+  sec=$(whiptail --title "$BT" --menu "Wi-Fi security (current: ${WIFI_SECURITY:-wpa2})" 18 76 5 \
+    "wpa2"     "WPA2-PSK  - most compatible (recommended for Pi 3B)" \
+    "wpa2wpa3" "WPA2/WPA3 mixed - new devices WPA3, old ones WPA2" \
+    "wpa3"     "WPA3-SAE only - may be unstable on Pi 3B onboard Wi-Fi" \
+    "open"     "Open network - NO password (testing only)" \
+    3>&1 1>&2 2>&3) || return
+  if [ "$sec" = "open" ]; then
+    pass="${WIFI_PASS}"
+  else
+    pass=$(inbox "Wi-Fi password (min 8 chars):" "$WIFI_PASS") || return
+    [ ${#pass} -ge 8 ] || { msg "Password must be at least 8 characters."; return; }
+  fi
+  ch=$(inbox "Wi-Fi channel (1-13):" "$WIFI_CHANNEL") || return
+  [ "$sec" = "wpa3" ] && msg "Note: WPA3 (SAE) on the Pi 3B built-in Wi-Fi can be unstable in access-point mode. If some devices fail to connect, switch to 'wpa2' or 'wpa2wpa3'."
+  set_conf WIFI_SSID "$ssid"
+  set_conf WIFI_PASS "$pass"
+  set_conf WIFI_CHANNEL "$ch"
+  set_conf WIFI_SECURITY "$sec"
+  if yesno "Apply Wi-Fi changes now?"; then apply_all; fi
+}
+
+# ------------------------------------------------------------------ NETWORK / IP
+net_menu() {
+  load_conf
+  local ip s e
+  ip=$(inbox "Router LAN IP address:" "$LAN_IP") || return
+  valid_ip "$ip" || { msg "Invalid IP: $ip"; return; }
+  local base="${ip%.*}"
+  s=$(inbox "DHCP range start:" "${DHCP_START:-$base.50}") || return
+  e=$(inbox "DHCP range end:"   "${DHCP_END:-$base.200}") || return
+  valid_ip "$s" && valid_ip "$e" || { msg "Invalid DHCP range."; return; }
+  set_conf LAN_IP "$ip"
+  set_conf DHCP_START "$s"
+  set_conf DHCP_END "$e"
+  if yesno "Apply network changes now?\n\nYou may need to reconnect to the new IP ($ip)."; then
+    apply_all
+  fi
+}
+
+# ------------------------------------------------------------------ MAC
+mac_menu() {
+  load_conf
+  local choice
+  choice=$(whiptail --title "$BT" --menu "MAC address management" 19 74 8 \
+    "1" "Wi-Fi MAC  (current cfg: ${WIFI_MAC})" \
+    "2" "WAN MAC    (current cfg: ${WAN_MAC})" \
+    "3" "Saved MAC profiles (address book)" \
+    "4" "Show current MACs" \
+    3>&1 1>&2 2>&3) || return
+  case "$choice" in
+    1) mac_set wifi ;;
+    2) mac_set wan  ;;
+    3) mac_profiles_menu ;;
+    4) msg "$(pirouter-mac show)" ;;
+  esac
+}
+mac_set() {
+  local tgt="$1" how val
+  local -a extra=()
+  [ -s "$MAC_STORE" ] && extra=("saved" "Pick from saved MAC profiles")
+  how=$(whiptail --title "$BT" --menu "Set ${tgt} MAC" 16 62 5 \
+    "auto"   "Use hardware default" \
+    "random" "Generate a random MAC" \
+    "manual" "Type a specific MAC" \
+    "${extra[@]}" \
+    3>&1 1>&2 2>&3) || return
+  case "$how" in
+    auto)   val="auto" ;;
+    random) val="random" ;;
+    manual)
+      val=$(inbox "Enter MAC (AA:BB:CC:DD:EE:FF):" "") || return
+      valid_mac "$val" || { msg "Invalid MAC format."; return; }
+      ;;
+    saved)
+      val=$(mac_profile_pick) || return
+      [ -n "$val" ] || return
+      ;;
+    *) return ;;
+  esac
+  pirouter-mac set "$tgt" "$val" && msg "MAC updated. New value:\n\n$(pirouter-mac show)"
+}
+
+# print a whiptail picker of saved MAC profiles, echo the chosen NAME
+mac_profile_pick() {
+  local -a items=(); local name mac
+  while IFS=$'\t' read -r name mac; do
+    [ -n "$name" ] || continue
+    items+=("$name" "$mac")
+  done <"$MAC_STORE"
+  whiptail --title "$BT" --menu "Choose a saved MAC:" 18 60 8 "${items[@]}" 3>&1 1>&2 2>&3
+}
+
+mac_profiles_menu() {
+  while true; do
+    local choice
+    choice=$(whiptail --title "$BT" --menu "Saved MAC profiles" 18 70 8 \
+      "1" "List saved MACs" \
+      "2" "Save a new MAC (type it)" \
+      "3" "Save the CURRENT Wi-Fi MAC" \
+      "4" "Save the CURRENT WAN MAC" \
+      "5" "Delete a saved MAC" \
+      "6" "Back" \
+      3>&1 1>&2 2>&3) || return
+    case "$choice" in
+      1) msg "$(pirouter-mac profile list)" ;;
+      2) local nm mc
+         nm=$(inbox "Profile name:" "") || continue
+         mc=$(inbox "MAC (AA:BB:CC:DD:EE:FF):" "") || continue
+         valid_mac "$mc" || { msg "Invalid MAC."; continue; }
+         pirouter-mac profile save "$nm" "$mc" && msg "Saved '$nm'." ;;
+      3) local nm; nm=$(inbox "Profile name for current Wi-Fi MAC:" "") || continue
+         pirouter-mac profile savecur "$nm" wifi && msg "Saved current Wi-Fi MAC as '$nm'." ;;
+      4) local nm; nm=$(inbox "Profile name for current WAN MAC:" "") || continue
+         pirouter-mac profile savecur "$nm" wan && msg "Saved current WAN MAC as '$nm'." ;;
+      5) [ -s "$MAC_STORE" ] || { msg "Nothing to delete."; continue; }
+         local pick; pick=$(mac_profile_pick) || continue
+         [ -n "$pick" ] && pirouter-mac profile del "$pick" && msg "Deleted '$pick'." ;;
+      6) return ;;
+    esac
+  done
+}
+
+# ------------------------------------------------------------------ LOGS
+logs_menu() {
+  while true; do
+    local choice
+    choice=$(whiptail --title "$BT" --menu "Logs & diagnostics" 18 70 8 \
+      "1" "View error log (warnings + errors)" \
+      "2" "View full activity log" \
+      "3" "Ping test (1.1.1.1)" \
+      "4" "Show public IP (as seen online)" \
+      "5" "Live firewall rules" \
+      "6" "Clear logs" \
+      "7" "Back" \
+      3>&1 1>&2 2>&3) || return
+    case "$choice" in
+      1) show_file "$ERRLOG" "No errors logged." ;;
+      2) show_file "$LOG" "Log is empty." ;;
+      3) local o; o=$(test_ping 1.1.1.1 4 2>&1); msg "$o" ;;
+      4) local ip; ip=$(pub_ip || echo "unavailable")
+         msg "Public IP (router default route):\n\n${ip}" ;;
+      5) whiptail --title "$BT" --scrolltext --msgbox "$(pirouter-killswitch status 2>&1)" 24 78 ;;
+      6) yesno "Clear both log files?" && { : >"$LOG"; : >"$ERRLOG"; msg "Logs cleared."; } ;;
+      7) return ;;
+    esac
+  done
+}
+show_file() {
+  local f="$1" empty="$2" body
+  if [ -s "$f" ]; then
+    body=$(tail -n 200 "$f")
+  else
+    body="$empty"
+  fi
+  whiptail --title "$BT" --scrolltext --msgbox "$body" 24 78
+}
+
+# ------------------------------------------------------------------ KILL SWITCH
+kill_menu() {
+  load_conf
+  if yesno "Kill switch is currently: ${KILLSWITCH}\n\nEnable kill switch? (No = disable)\n\nWhen ON, clients get NO internet unless the VPN tunnel is up."; then
+    pirouter-killswitch on && msg "Kill switch ENABLED."
+  else
+    pirouter-killswitch off && msg "Kill switch DISABLED (traffic routes via WAN)."
+  fi
+}
+
+# ------------------------------------------------------------------ VPN
+vpn_menu() {
+  load_conf
+  local choice
+  choice=$(whiptail --title "$BT" --menu "VPN / Proxy  (active: ${ACTIVE_VPN}${VLESS_ACTIVE:+ / $VLESS_ACTIVE})" 21 74 11 \
+    "1" "VLESS    - manage up to 5 configs & connect" \
+    "2" "OpenVPN  - upload/use client.conf" \
+    "3" "L2TP/IPsec - server, PSK, user/pass" \
+    "4" "PROXY    - socks5 / http upstream" \
+    "5" "Test connection (ping + IP check)" \
+    "6" "Disconnect (no VPN)" \
+    "7" "VPN status" \
+    3>&1 1>&2 2>&3) || return
+  case "$choice" in
+    1) vless_menu ;;
+    2) vpn_openvpn ;;
+    3) vpn_l2tp ;;
+    4) vpn_proxy ;;
+    5) vpn_test_ui ;;
+    6) run_step "pirouter-vpn down" "Disconnecting..." ;;
+    7) msg "$(pirouter-vpn status)" ;;
+  esac
+}
+
+# ---- VLESS multi-profile manager (up to 5) ----
+vless_menu() {
+  while true; do
+    load_conf
+    local n choice
+    n=$(vless_count)
+    choice=$(whiptail --title "$BT" --menu \
+      "VLESS configs: ${n}/${VLESS_MAX}   active: ${VLESS_ACTIVE:-none}" 20 74 10 \
+      "1" "Connect / switch to a saved config" \
+      "2" "Add a new vless:// config" \
+      "3" "Delete a saved config" \
+      "4" "Show saved configs" \
+      "5" "Test current VLESS (ping + IP)" \
+      "6" "Back" \
+      3>&1 1>&2 2>&3) || return
+    case "$choice" in
+      1) vless_pick_connect ;;
+      2) vless_add_ui ;;
+      3) vless_delete_ui ;;
+      4) vless_show_ui ;;
+      5) vpn_test_ui ;;
+      6) return ;;
+    esac
+  done
+}
+
+# build a whiptail --menu argument list from stored profile names
+_vless_menu_items() {
+  local i=0 name
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    i=$((i+1))
+    printf '%s\n%s\n' "$name" "config #$i"
+  done < <(vless_names)
+}
+
+vless_pick_connect() {
+  local n; n=$(vless_count)
+  [ "$n" -gt 0 ] || { msg "No saved VLESS configs yet. Add one first."; return; }
+  local -a items=(); local line
+  while IFS= read -r line; do items+=("$line"); done < <(_vless_menu_items)
+  local pick
+  pick=$(whiptail --title "$BT" --menu "Select a VLESS config to connect:" 18 70 8 \
+    "${items[@]}" 3>&1 1>&2 2>&3) || return
+  vless_select "$pick"
+  run_step "pirouter-vpn up vless" "Connecting VLESS ($pick)..."
+}
+
+vless_add_ui() {
+  load_conf
+  local n; n=$(vless_count)
+  if [ "$n" -ge "$VLESS_MAX" ]; then
+    msg "You already have ${VLESS_MAX} configs saved. Delete one before adding a new config."
+    return
+  fi
+  local name url
+  name=$(inbox "Name for this config (e.g. Germany):" "") || return
+  [ -n "$name" ] || { msg "Empty name."; return; }
+  url=$(inbox "Paste full vless:// link:" "") || return
+  case "$url" in
+    vless://*) : ;;
+    *) msg "That is not a vless:// link."; return ;;
+  esac
+  if vless_add "$name" "$url"; then
+    if yesno "Config '$name' saved.\n\nConnect to it now?"; then
+      vless_select "$name"
+      run_step "pirouter-vpn up vless" "Connecting VLESS ($name)..."
+    fi
+  else
+    msg "Could not save config (limit reached or invalid link)."
+  fi
+}
+
+vless_delete_ui() {
+  local n; n=$(vless_count)
+  [ "$n" -gt 0 ] || { msg "Nothing to delete."; return; }
+  local -a items=(); local line
+  while IFS= read -r line; do items+=("$line"); done < <(_vless_menu_items)
+  local pick
+  pick=$(whiptail --title "$BT" --menu "Delete which VLESS config?" 18 70 8 \
+    "${items[@]}" 3>&1 1>&2 2>&3) || return
+  yesno "Delete config '$pick'?" || return
+  vless_del "$pick"
+  msg "Deleted '$pick'."
+}
+
+vless_show_ui() {
+  load_conf
+  local out
+  if [ -s "$VLESS_STORE" ]; then
+    # show name + host:port only (never reveal the UUID)
+    out=$(awk -F'\t' '{
+      u=$2; sub(/^vless:\/\/[^@]*@/,"",u); sub(/[?#].*$/,"",u);
+      mark=($1==active)?" *":"  ";
+      printf "%s%-14s %s\n", mark, $1, u
+    }' active="${VLESS_ACTIVE:-}" "$VLESS_STORE")
+    out="Saved VLESS configs ( * = active ):\n\n${out}"
+  else
+    out="No saved VLESS configs yet."
+  fi
+  msg "$out"
+}
+
+vpn_test_ui() {
+  local out
+  out=$( { pirouter-vpn test; } 2>&1 )
+  whiptail --title "$BT" --scrolltext --msgbox "$out" 20 74
+}
+
+vpn_openvpn() {
+  local cfg="/etc/pirouter/openvpn/client.conf"
+  if [ ! -f "$cfg" ]; then
+    msg "No OpenVPN config found.\n\nUpload your .ovpn file to:\n$cfg\n\n(e.g. from your PC:\n scp client.ovpn pi@${LAN_IP:-192.168.33.1}:${cfg})"
+    return
+  fi
+  run_step "pirouter-vpn up openvpn" "Connecting OpenVPN..."
+}
+
+vpn_l2tp() {
+  load_conf
+  local srv psk usr pas
+  srv=$(inbox "L2TP server address:" "$L2TP_SERVER") || return
+  psk=$(pwbox "IPsec pre-shared key (PSK):") || return
+  usr=$(inbox "Username:" "$L2TP_USER") || return
+  pas=$(pwbox "Password:") || return
+  set_conf L2TP_SERVER "$srv"
+  set_conf L2TP_PSK "$psk"
+  set_conf L2TP_USER "$usr"
+  set_conf L2TP_PASS "$pas"
+  run_step "pirouter-vpn up l2tp" "Connecting L2TP/IPsec..."
+}
+
+vpn_vless() {
+  load_conf
+  local url
+  url=$(inbox "Paste full vless:// link:" "$VLESS_URL") || return
+  [ -n "$url" ] || { msg "Empty link."; return; }
+  set_conf VLESS_URL "$url"
+  run_step "pirouter-vpn up vless" "Starting VLESS (Xray)..."
+}
+
+vpn_proxy() {
+  load_conf
+  local t h p u pw
+  t=$(whiptail --title "$BT" --menu "Proxy type" 12 50 2 \
+      "socks5" "SOCKS5 upstream" "http" "HTTP upstream" 3>&1 1>&2 2>&3) || return
+  h=$(inbox "Proxy host/IP:" "$PROXY_HOST") || return
+  p=$(inbox "Proxy port:" "$PROXY_PORT") || return
+  u=$(inbox "Username (blank if none):" "$PROXY_USER") || return
+  pw=$(pwbox "Password (blank if none):") || pw=""
+  set_conf PROXY_TYPE "$t"; set_conf PROXY_HOST "$h"; set_conf PROXY_PORT "$p"
+  set_conf PROXY_USER "$u"; set_conf PROXY_PASS "$pw"
+  run_step "pirouter-vpn up proxy" "Connecting proxy (Xray)..."
+}
+
+# run a command, show output/result in a box
+run_step() {
+  local cmd="$1" title="$2" out rc
+  out=$(eval "$cmd" 2>&1); rc=$?
+  if [ $rc -eq 0 ]; then
+    msg "OK: ${title}\n\n$(echo "$out" | tail -8)"
+  else
+    msg "FAILED (rc=$rc):\n\n$(echo "$out" | tail -12)"
+  fi
+}
+
+# ------------------------------------------------------------------ MAIN
+main_menu() {
+  while true; do
+    local choice
+    choice=$(whiptail --title "$BT" --menu "Select an option" 23 74 13 \
+      "1" "Status overview" \
+      "2" "Router mode (main router / behind router)" \
+      "3" "Wi-Fi settings (SSID / password / channel)" \
+      "4" "Network / router IP / DHCP" \
+      "5" "VPN & Proxy (OpenVPN/L2TP/VLESS/Proxy)" \
+      "6" "MAC address (Wi-Fi / WAN)" \
+      "7" "Kill switch on/off" \
+      "8" "Apply & restart everything" \
+      "9" "Reboot Raspberry Pi" \
+      "0" "Exit" \
+      3>&1 1>&2 2>&3) || break
+    case "$choice" in
+      1) show_status ;;
+      2) mode_menu ;;
+      3) wifi_menu ;;
+      4) net_menu ;;
+      5) vpn_menu ;;
+      6) mac_menu ;;
+      7) kill_menu ;;
+      8) apply_all ;;
+      9) yesno "Reboot now?" && reboot ;;
+      0) break ;;
+    esac
+  done
+  clear
+}
+
+main_menu

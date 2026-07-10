@@ -1,0 +1,203 @@
+#!/usr/bin/env bash
+# ==========================================================================
+#  pirouter-killswitch  -  build the full firewall / NAT ruleset
+#
+#  Rebuilt from scratch on every run, driven by:
+#     ACTIVE_VPN  (none|openvpn|l2tp|vless|proxy)
+#     KILLSWITCH  (on|off)
+#     FORCE_DNS / BLOCK_QUIC / DISABLE_IPV6 / MGMT_WAN_SSH
+#
+#  Guarantees when a VPN is active:
+#    * ALL client TCP either goes through the tunnel or is dropped
+#    * client DNS is forced through the router (no DNS-server bypass)
+#    * QUIC (UDP/443) is blocked in proxy mode so browsers use tunnelled TCP
+#    * IPv6 is locked down so it cannot leak around the IPv4 tunnel
+#    * if the tunnel drops and kill switch is ON -> WAN egress is blocked
+#
+#  usage: pirouter-killswitch {apply|on|off|status}
+# ==========================================================================
+set -uo pipefail
+source /usr/local/lib/pirouter/common.sh
+need_root
+load_conf
+enable_error_trap
+
+RESERVED="0.0.0.0/8 10.0.0.0/8 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4"
+
+# -------------------------------------------------------------- reset
+flush() {
+  iptables -F
+  iptables -t nat -F
+  iptables -t mangle -F 2>/dev/null || true
+  iptables -X 2>/dev/null || true
+  iptables -P INPUT ACCEPT
+  iptables -P FORWARD ACCEPT
+  iptables -P OUTPUT ACCEPT
+}
+
+# -------------------------------------------------------------- router self (INPUT)
+harden_input() {
+  iptables -P INPUT DROP           # default-deny, then allow only what we need
+  iptables -A INPUT -i lo -j ACCEPT
+  iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  iptables -A INPUT -m conntrack --ctstate INVALID -j DROP
+  iptables -A INPUT -p icmp --icmp-type echo-request -m limit --limit 5/s -j ACCEPT
+
+  # --- LAN (Wi-Fi clients) may use core router services ---
+  iptables -A INPUT -i "$LAN_IF" -p udp --dport 67 -j ACCEPT      # DHCP
+  iptables -A INPUT -i "$LAN_IF" -p udp --dport 53 -j ACCEPT      # DNS
+  iptables -A INPUT -i "$LAN_IF" -p tcp --dport 53 -j ACCEPT
+  iptables -A INPUT -i "$LAN_IF" -p tcp --dport 22 -j ACCEPT      # SSH
+  # transparent-proxy landing port (REDIRECT delivers here) - LAN only
+  iptables -A INPUT -i "$LAN_IF" -p tcp --dport "$XRAY_REDIR_PORT" -j ACCEPT
+
+  # --- WAN side ---
+  iptables -A INPUT -i "$WAN_IF" -p udp --dport 68 -j ACCEPT      # keep DHCP lease
+  if [ "${MGMT_WAN_SSH:-on}" = "on" ]; then
+    iptables -A INPUT -i "$WAN_IF" -p tcp --dport 22 -j ACCEPT    # management SSH
+  fi
+  # NOTE: DNS (53) is intentionally NOT open on WAN -> not an open resolver.
+}
+
+nat_masquerade() { iptables -t nat -A POSTROUTING -o "$1" -j MASQUERADE; }
+
+# force every client DNS query (to any server) into the router's resolver
+force_dns() {
+  [ "${FORCE_DNS:-on}" = "on" ] || return 0
+  iptables -t nat -A PREROUTING -i "$LAN_IF" -p udp --dport 53 -j DNAT --to-destination "$LAN_IP"
+  iptables -t nat -A PREROUTING -i "$LAN_IF" -p tcp --dport 53 -j DNAT --to-destination "$LAN_IP"
+}
+
+# drop QUIC so browsers fall back to TCP (only meaningful for TCP-only tunnels)
+block_quic() {
+  [ "${BLOCK_QUIC:-on}" = "on" ] || return 0
+  iptables -A FORWARD -i "$LAN_IF" -p udp --dport 443 -j DROP
+  iptables -A FORWARD -i "$LAN_IF" -p udp --dport 80  -j DROP
+}
+
+# -------------------------------------------------------------- IPv6 lockdown
+ip6_lockdown() {
+  command -v ip6tables >/dev/null 2>&1 || return 0
+  ip6tables -F 2>/dev/null || true
+  ip6tables -X 2>/dev/null || true
+  if [ "${DISABLE_IPV6:-on}" = "on" ]; then
+    ip6tables -P INPUT DROP   2>/dev/null || true
+    ip6tables -P FORWARD DROP 2>/dev/null || true
+    ip6tables -P OUTPUT ACCEPT 2>/dev/null || true
+    ip6tables -A INPUT -i lo -j ACCEPT 2>/dev/null || true
+    ip6tables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+    ip6tables -A INPUT -i "$LAN_IF" -p tcp --dport 22 -j ACCEPT 2>/dev/null || true
+    sysctl -qw net.ipv6.conf.all.forwarding=0 2>/dev/null || true
+  fi
+  ip6tables-save >/etc/iptables/rules.v6 2>/dev/null || true
+}
+
+# -------------------------------------------------------------- forward policies
+# tunnel based VPNs (openvpn / l2tp): route LAN -> tun, block LAN -> WAN
+setup_tunnel_forward() {
+  local tun="$1"
+  iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  iptables -A FORWARD -i "$LAN_IF" -o "$tun" -j ACCEPT
+  iptables -A FORWARD -i "$LAN_IF" -o "$WAN_IF" -j DROP   # no direct-WAN leak, ever
+  nat_masquerade "$tun"
+}
+
+# transparent proxy (vless / proxy via xray)
+setup_xray_redirect() {
+  iptables -t nat -N PIROUTER_REDIR
+  for net in $RESERVED; do
+    iptables -t nat -A PIROUTER_REDIR -d "$net" -j RETURN
+  done
+  iptables -t nat -A PIROUTER_REDIR -p tcp -j REDIRECT --to-ports "$XRAY_REDIR_PORT"
+  iptables -t nat -A PREROUTING -i "$LAN_IF" -p tcp -j PIROUTER_REDIR
+
+  iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  block_quic
+  if [ "$KILLSWITCH" = "on" ]; then
+    # captured TCP is handled locally by xray; nothing else may reach WAN
+    iptables -A FORWARD -i "$LAN_IF" -o "$WAN_IF" -j DROP
+  else
+    # allow leftover (non-TCP) traffic straight out when kill switch is off
+    iptables -A FORWARD -i "$LAN_IF" -o "$WAN_IF" -j ACCEPT
+    nat_masquerade "$WAN_IF"
+  fi
+}
+
+# plain NAT (no vpn, kill switch off)
+setup_plain_nat() {
+  iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  iptables -A FORWARD -i "$LAN_IF" -o "$WAN_IF" -j ACCEPT
+  nat_masquerade "$WAN_IF"
+}
+
+# kill everything to WAN (kill switch on, no working tunnel)
+setup_blocked() {
+  iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  iptables -A FORWARD -i "$LAN_IF" -o "$WAN_IF" -j DROP
+  log_warn "killswitch: WAN egress BLOCKED (no active tunnel)"
+}
+
+# -------------------------------------------------------------- apply
+apply() {
+  flush
+  iptables -P FORWARD DROP
+  harden_input
+  force_dns
+
+  local tun; tun="$(vpn_tun_iface)"
+
+  case "$ACTIVE_VPN" in
+    openvpn|l2tp)
+      if [ -n "$tun" ] && [ "$tun" != "xray" ]; then
+        setup_tunnel_forward "$tun"
+        log "firewall: routing LAN -> $tun (killswitch=$KILLSWITCH)"
+      elif [ "$KILLSWITCH" = "on" ]; then
+        setup_blocked
+      else
+        setup_plain_nat
+      fi
+      ;;
+    vless|proxy)
+      if is_service_active xray; then
+        setup_xray_redirect
+        log "firewall: transparent proxy via xray (killswitch=$KILLSWITCH)"
+      elif [ "$KILLSWITCH" = "on" ]; then
+        setup_blocked
+      else
+        setup_plain_nat
+      fi
+      ;;
+    *)
+      if [ "$KILLSWITCH" = "on" ]; then
+        setup_blocked
+      else
+        setup_plain_nat
+        log "firewall: plain NAT via $WAN_IF"
+      fi
+      ;;
+  esac
+
+  ip6_lockdown
+
+  mkdir -p /etc/iptables
+  iptables-save  >/etc/iptables/rules.v4 2>/dev/null || true
+}
+
+status() {
+  echo "KILLSWITCH : $KILLSWITCH"
+  echo "ACTIVE_VPN : $ACTIVE_VPN"
+  echo "TUNNEL     : $(vpn_tun_iface || echo none)"
+  echo "FORCE_DNS  : ${FORCE_DNS:-on}   BLOCK_QUIC: ${BLOCK_QUIC:-on}   IPv6-off: ${DISABLE_IPV6:-on}"
+  echo
+  echo "== FORWARD chain =="; iptables -S FORWARD
+  echo; echo "== nat PREROUTING =="; iptables -t nat -S PREROUTING
+  echo; echo "== nat POSTROUTING =="; iptables -t nat -S POSTROUTING
+}
+
+case "${1:-apply}" in
+  apply) apply ;;
+  on)  set_conf KILLSWITCH on;  apply ;;
+  off) set_conf KILLSWITCH off; apply ;;
+  status) status ;;
+  *) echo "usage: pirouter-killswitch {apply|on|off|status}"; exit 1 ;;
+esac
