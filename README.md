@@ -27,15 +27,11 @@
 режиме SSH также доступен из твоей основной сети, так что управлять малиной можно с любого  
 устройства дома.
 
-> Примечание: это не готовый `.img`. Вместо этого ты один раз прошиваешь официальный  
-> Raspberry Pi OS Lite, а затем запускаешь одну команду установки. Итоговый результат  
-> идентичен кастомной прошивке, но собирать его гораздо надёжнее.
-
 ---
 
 ## 1. Прошивка Raspberry Pi OS Lite
 
-Можно использовать **Balena Etcher**, ровно как ты и хотел:
+Можно использовать **Balena Etcher**
 
 1. Скачай **Raspberry Pi OS Lite (64-bit)** `.img.xz` с  
     [https://www.raspberrypi.com/software/operating-systems/](https://www.raspberrypi.com/software/operating-systems/)
